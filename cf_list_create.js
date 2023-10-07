@@ -1,181 +1,146 @@
-require("dotenv").config();
-const fs = require('fs');
-const axios = require('axios');
+import { existsSync } from "fs";
+import { resolve } from "path";
 
-const API_TOKEN = process.env.CLOUDFLARE_API_KEY;
-const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
-const ACCOUNT_EMAIL = process.env.CLOUDFLARE_ACCOUNT_EMAIL;
-const LIST_ITEM_LIMIT = Number.isSafeInteger(Number(process.env.CLOUDFLARE_LIST_ITEM_LIMIT)) ? Number(process.env.CLOUDFLARE_LIST_ITEM_LIMIT) : 300000;
+import {
+  createZeroTrustListsAtOnce,
+  createZeroTrustListsOneByOne,
+} from "./lib/api.js";
+import {
+  DRY_RUN,
+  FAST_MODE,
+  LIST_ITEM_LIMIT,
+  LIST_ITEM_SIZE,
+  PROCESSING_FILENAME,
+} from "./lib/constants.js";
+import { normalizeDomain } from "./lib/helpers.js";
+import {
+  extractDomain,
+  isComment,
+  isValidDomain,
+  readFile,
+} from "./lib/utils.js";
 
-if (!process.env.CI) console.log(`List item limit set to ${LIST_ITEM_LIMIT}`);
+const allowlistFilename = existsSync(PROCESSING_FILENAME.OLD_ALLOWLIST)
+  ? PROCESSING_FILENAME.OLD_ALLOWLIST
+  : PROCESSING_FILENAME.ALLOWLIST;
+const blocklistFilename = existsSync(PROCESSING_FILENAME.OLD_BLOCKLIST)
+  ? PROCESSING_FILENAME.OLD_BLOCKLIST
+  : PROCESSING_FILENAME.BLOCKLIST;
+const allowlist = new Map();
+const blocklist = new Map();
+const domains = [];
+let processedDomainCount = 0;
+let unnecessaryDomainCount = 0;
+let duplicateDomainCount = 0;
+let allowedDomainCount = 0;
 
-let whitelist = []; // Define an empty array for the whitelist
+// Read allowlist
+console.log(`Processing ${allowlistFilename}`);
+await readFile(resolve(`./${allowlistFilename}`), (line) => {
+  const _line = line.trim();
 
-// Read whitelist.csv and parse
-fs.readFile('whitelist.csv', 'utf8', async (err, data) => {
-  if (err) {
-    console.warn('Error reading whitelist.csv:', err);
-    console.warn('Assuming whitelist is empty.')
-  } else {
-    // Convert into array and cleanup whitelist
-    const domainValidationPattern = /^(?!-)[A-Za-z0-9-]+([\-\.]{1}[a-z0-9]+)*\.[A-Za-z]{2,6}$/;
-    whitelist = data.split('\n').filter(domain => {
-      // Remove entire lines starting with "127.0.0.1" or "::1", empty lines or comments
-      return domain && !domain.startsWith('#') && !domain.startsWith('//') && !domain.startsWith('/*') && !domain.startsWith('*/') && !(domain === '\r');
-    }).map(domain => {
-      // Remove "\r", "0.0.0.0 ", "127.0.0.1 ", "::1 " and similar from domain items
-      return domain
-        .replace('\r', '')
-        .replace('0.0.0.0 ', '')
-        .replace('127.0.0.1 ', '')
-        .replace('::1 ', '')
-        .replace(':: ', '')
-        .replace('||', '')
-        .replace('@@||', '')
-        .replace('^$important', '')
-        .replace('*.', '')
-        .replace('^', '');
-    }).filter(domain => {
-      return domainValidationPattern.test(domain);
-    });
-    console.log(`Found ${whitelist.length} valid domains in whitelist.`);
-  }  
+  if (!_line) return;
+
+  if (isComment(_line)) return;
+
+  const domain = normalizeDomain(_line, true);
+
+  if (!isValidDomain(domain)) return;
+
+  allowlist.set(domain, 1);
 });
 
-
-// Read input.csv and parse domains
-fs.readFile('input.csv', 'utf8', async (err, data) => {
-  if (err) {
-    console.error('Error reading input.csv:', err);
+// Read blocklist
+console.log(`Processing ${blocklistFilename}`);
+await readFile(resolve(`./${blocklistFilename}`), (line, rl) => {
+  if (domains.length === LIST_ITEM_LIMIT) {
     return;
   }
 
-  // Convert into array and cleanup input
-  const domainValidationPattern = /^(?!-)[A-Za-z0-9-]+([\-\.]{1}[a-z0-9]+)*\.[A-Za-z]{2,6}$/;
-  let domains = data.split('\n').filter(domain => {
-    // Remove entire lines starting with "127.0.0.1" or "::1", empty lines or comments
-    return domain && !domain.startsWith('#') && !domain.startsWith('//') && !domain.startsWith('/*') && !domain.startsWith('*/') && !(domain === '\r');
-  }).map(domain => {
-    // Remove "\r", "0.0.0.0 ", "127.0.0.1 ", "::1 " and similar from domain items
-    return domain
-      .replace('\r', '')
-      .replace('0.0.0.0 ', '')
-      .replace('127.0.0.1 ', '')
-      .replace('::1 ', '')
-      .replace(':: ', '')
-      .replace('^', '')
-      .replace('||', '')
-      .replace('@@||', '')
-      .replace('^$important', '')
-      .replace('*.', '')
-      .replace('^', '');
-  }).filter(domain => {
-    return domainValidationPattern.test(domain);
-  });
+  const _line = line.trim();
 
-  // Check for duplicates in domains array
-  let uniqueDomains = [];
-  let seen = new Set(); // Use a set to store seen values
-  for (let domain of domains) {
-    if (!seen.has(domain)) { // If the domain is not in the set
-      seen.add(domain); // Add it to the set
-      uniqueDomains.push(domain); // Push the domain to the uniqueDomains array
-    } else { // If the domain is in the set
-      console.warn(`Duplicate domain found: ${domain} - removing`); // Log the duplicate domain
-    }
-  }
+  if (!_line) return;
 
-  // Replace domains array with uniqueDomains array
-  domains = uniqueDomains;
+  // Check if the current line is a comment in any format
+  if (isComment(_line)) return;
 
-  // Remove domains from the domains array that are present in the whitelist array
-  domains = domains.filter(domain => {
-    if (whitelist.includes(domain)) {
-      console.warn(`Domain found in the whitelist: ${domain} - removing`);
+  // Remove prefixes and suffixes in hosts, wildcard or adblock format
+  const domain = normalizeDomain(_line);
+
+  // Check if it is a valid domain which is not a URL or does not contain
+  // characters like * in the middle of the domain
+  if (!isValidDomain(domain)) return;
+
+  processedDomainCount++;
+
+  // Get all the levels of the domain and check from the highest
+  // because we are blocking all subdomains
+  // Example: fourth.third.example.com => ["example.com", "third.example.com", "fourth.third.example.com"]
+  const anyDomainExists = extractDomain(domain)
+    .reverse()
+    .some((item) => {
+      if (blocklist.has(item)) {
+        if (item === domain) {
+          // The exact domain is already blocked
+          console.log(`Found ${item} in blocklist already - Skipping`);
+          duplicateDomainCount++;
+        } else {
+          // The higher-level domain is already blocked
+          // so it's not necessary to block this domain
+          console.log(
+            `Found ${item} in blocklist already - Skipping ${domain}`
+          );
+          unnecessaryDomainCount++;
+        }
+
+        return true;
+      }
+
       return false;
-    }
-    return true;
-  });
-
-  // Trim array to 300,000 domains if it's longer than that
-  if (domains.length > LIST_ITEM_LIMIT) {
-    domains = trimArray(domains, LIST_ITEM_LIMIT);
-    console.warn(`More than ${LIST_ITEM_LIMIT} domains found in input.csv - input has to be trimmed`);
-  }
-
-  const listsToCreate = Math.ceil(domains.length / 1000);
-
-  if (!process.env.CI) console.log(`Found ${domains.length} valid domains in input.csv after cleanup - ${listsToCreate} list(s) will be created`);
-
-  // Separate domains into chunks of 1000 (Cloudflare list cap)
-  const chunks = chunkArray(domains, 1000);
-
-  // Create Cloudflare Zero Trust lists
-  for (const [index, chunk] of chunks.entries()) {
-    const listName = `CGPS List - Chunk ${index}`;
-
-    let properList = [];
-
-    chunk.forEach(domain => {
-        properList.push({ "value": domain })
     });
 
-    try {
-      await createZeroTrustList(listName, properList, (index+1), listsToCreate);
-      await sleep(350); // Sleep for 350ms between list additions
-    } catch (error) {
-      console.error(`Error creating list `, process.env.CI ? "(redacted on CI)" :  `"${listName}": ${error.response.data}`);
-    }
+  if (anyDomainExists) return;
+
+  if (allowlist.has(domain)) {
+    console.log(`Found ${domain} in allowlist - Skipping`);
+    allowedDomainCount++;
+    return;
+  }
+
+  blocklist.set(domain, 1);
+  domains.push(domain);
+
+  if (domains.length === LIST_ITEM_LIMIT) {
+    console.log(
+      "Maximum number of blocked domains reached - Stopping processing blocklist..."
+    );
+    rl.close();
   }
 });
 
-function trimArray(arr, size) {
-  return arr.slice(0, size);
-}
+console.log("\n\n");
+console.log(`Number of processed domains: ${processedDomainCount}`);
+console.log(`Number of duplicate domains: ${duplicateDomainCount}`);
+console.log(`Number of unnecessary domains: ${unnecessaryDomainCount}`);
+console.log(`Number of blocked domains: ${domains.length}`);
+console.log(`Number of allowed domains: ${allowedDomainCount}`);
+console.log(
+  `Number of lists to be created: ${Math.ceil(domains.length / LIST_ITEM_SIZE)}`
+);
+console.log("\n\n");
 
-// Function to check if a domain is valid
-function isValidDomain(domain) {
-    const regex = /^((?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)+[A-Za-z]{2,6}$/;
-    return regex.test(domain);
-}
-
-// Function to split an array into chunks
-function chunkArray(array, chunkSize) {
-  const chunks = [];
-  for (let i = 0; i < array.length; i += chunkSize) {
-    chunks.push(array.slice(i, i + chunkSize));
+(async () => {
+  if (DRY_RUN) {
+    console.log(
+      "Dry run complete - no lists were created. If this was not intended, please remove the DRY_RUN environment variable and try again."
+    );
+    return;
   }
-  return chunks;
-}
 
-// Function to create a Cloudflare Zero Trust list
-async function createZeroTrustList(name, items, currentItem, totalItems) {
-  const response = await axios.post(
-    `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists`,
-    {
-      name,
-      type: 'DOMAIN', // Set list type to DOMAIN
-      items,
-    },
-    {
-      headers: {
-        'Authorization': `Bearer ${API_TOKEN}`,
-        'Content-Type': 'application/json',
-        'X-Auth-Email': ACCOUNT_EMAIL,
-        'X-Auth-Key': API_TOKEN,
-      },
-    }
-  );
+  if (FAST_MODE) {
+    await createZeroTrustListsAtOnce(domains);
+    return;
+  }
 
-  const listId = response.data.result.id;
-  console.log(`Created Zero Trust list`, process.env.CI ? "(redacted on CI)" : `"${name}" with ID ${listId} - ${totalItems - currentItem} left`);
-}
-
-function percentage(percent, total) {
-  return Math.round((percent / 100) * total);
-}
-
-// Function to sleep for a specified duration
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+  await createZeroTrustListsOneByOne(domains);
+})();

@@ -7,9 +7,10 @@ Cloudflare Gateway allows you to create custom rules to filter HTTP, DNS, and ne
 ## About the individual scripts
 
 - `cf_list_delete.js` - Deletes all lists created by CGPS from Cloudflare Gateway. This is useful for subsequent runs.
-- `cf_list_create.js` - Takes an input.csv file containing domains and creates lists in Cloudflare Gateway
+- `cf_list_create.js` - Takes a blocklist.txt file containing domains and creates lists in Cloudflare Gateway
 - `cf_gateway_rule_create.js` - Creates a Cloudflare Gateway rule to block all traffic if it matches the lists created by CGPS.
 - `cf_gateway_rule_delete.js` - Deletes the Cloudflare Gateway rule created by CGPS. Useful for subsequent runs.
+- `download_lists.js` - Initiates blocklist and whitelist download.
 
 ## Features
 
@@ -20,7 +21,6 @@ Cloudflare Gateway allows you to create custom rules to filter HTTP, DNS, and ne
 - Whitelist support, allowing you to prevent false positives and breakage by forcing trusted domains to always be unblocked.
 - Optional health check: Sends a ping request ensuring continuous monitoring and alerting for the workflow execution.
 
-
 ## Usage
 
 ### Prerequisites
@@ -28,8 +28,8 @@ Cloudflare Gateway allows you to create custom rules to filter HTTP, DNS, and ne
 1. Node.js installed on your machine
 2. Cloudflare [Zero Trust](https://one.dash.cloudflare.com/) account - the Free plan is enough. Use the Cloudflare [documentation](https://developers.cloudflare.com/cloudflare-one/) for details.
 3. Cloudflare email, API key (NOT the API token), and account ID
-4. A file containing the domains you want to block - **max 300,000 domains for the free plan** - in the working directory named `input.csv`. Mullvad provides awesome [DNS blocklists](https://github.com/mullvad/dns-blocklists) that work well with this project. A bash script that downloads recommended blocklists, `get_recommended_filters.sh`, is included.
-5. Optional: You can whitelist domains by putting them in a file `whitelist.csv`. You can also use the `get_recomended_whitelist.sh` Bash script to get the recommended whitelists.
+4. A file containing the domains you want to block - **max 300,000 domains for the free plan** - in the working directory named `blocklist.txt`. Mullvad provides awesome [DNS blocklists](https://github.com/mullvad/dns-blocklists) that work well with this project. A bash script that downloads recommended blocklists, `get_recommended_filters.sh`, is included.
+5. Optional: You can whitelist domains by putting them in a file `allowlist.txt`. You can also use the `get_recomended_whitelist.sh` Bash script to get the recommended whitelists.
 
 ### Running locally
 
@@ -57,9 +57,14 @@ Please note that the GitHub Action downloads the recommended blocklists and whit
 - `CLOUDFLARE_LIST_ITEM_LIMIT`: The maximum number of blocked domains allowed for your Cloudflare Zero Trust plan. Use 300000 for the free plan or if you're unsure.
 - `PING_URL`: /Optional/ The HTTP(S) URL to ping (using curl) after the GitHub Action has successfully updated your filters. Useful for monitoring.
 
+3. Create the following GitHub Actions variables in your repository settings if you desire:
 
-3. Create a new file in the repository named `.github/workflows/main.yml` with the contents of `auto_update_github_action.yml` found in this repository. The default settings will update your filters every week at 3 AM UTC. You can change this by editing the `schedule` property.
-4. Enable GitHub Actions in your repository settings.
+- `FAST_MODE`: Enable the scripts to send the requests simultaneously. Beware that there's a rate limit of 1200 requests per five minutes (https://developers.cloudflare.com/fundamentals/api/reference/limits/) so make sure you know what you are doing.
+- `ALLOWLIST_URLS`: Uses your own allowlists. One URL per line. Recommended allowlists will be used if this variable is not provided.
+- `BLOCKLIST_URLS`: Uses your own blocklists. One URL per line. Recommended blocklists will be used if this variable is not provided.
+
+4. Create a new file in the repository named `.github/workflows/main.yml` with the contents of `auto_update_github_action.yml` found in this repository. The default settings will update your filters every week at 3 AM UTC. You can change this by editing the `schedule` property.
+5. Enable GitHub Actions in your repository settings.
 
 ### DNS setup for Cloudflare Gateway
 
@@ -68,6 +73,12 @@ Please note that the GitHub Action downloads the recommended blocklists and whit
 3. Configure your router or device based on the provided DNS addresses.
 
 Alternatively, you can install the Cloudflare WARP client and log in to Zero Trust. This method proxies your traffic over Cloudflare servers, meaning it works similarly to a commercial VPN.
+
+### Dry runs
+
+To see if e.g. your filter lists are valid without actually changing anything in your Cloudflare account, you can set the `DRY_RUN` environment variable to 1, either in `.env` or the regular way. This will only print info such as the lists that would be created or the amount of duplicate domains to the console.
+
+**Warning:** This currently only works for `cf_list_create.js`.
 
 ## Why not...
 
@@ -82,7 +93,7 @@ Alternatively, you can install the Cloudflare WARP client and log in to Zero Tru
 
 ### Cloudflare Gateway?
 
-- Requires a valid credit card
+- Requires a valid credit card or PayPal account
 - Limit of 300k domains on the free plan
 
 ### a hosts file?
